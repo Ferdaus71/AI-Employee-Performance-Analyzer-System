@@ -15,16 +15,28 @@ import os
 import json
 import time
 from datetime import datetime, timedelta
-import plotly.graph_objects as go
-import plotly.express as px
 import base64
 import io
 import hashlib
 import warnings
 from typing import Dict, List, Optional, Any
-import mimetypes
+import sys
 
 warnings.filterwarnings('ignore')
+
+# Try to import Plotly, if not available, use matplotlib
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')
+    except ImportError:
+        plt = None
 
 # ============================================
 # 1. CONFIGURATION & INITIALIZATION
@@ -539,7 +551,7 @@ class DataManager:
                     'ai_recommendation', 'action_taken', 'analysis_timestamp', 'status'
                 ])
         except Exception as e:
-            print(f"Error loading dataset: {e}")
+            st.error(f"Error loading dataset: {str(e)[:100]}")
             return pd.DataFrame()
     
     def load_history(self) -> Dict[str, Any]:
@@ -551,7 +563,7 @@ class DataManager:
             else:
                 return {"analyses": [], "statistics": {}}
         except Exception as e:
-            print(f"Error loading history: {e}")
+            st.error(f"Error loading history: {str(e)[:100]}")
             return {"analyses": [], "statistics": {}}
     
     def load_config(self) -> Dict[str, Any]:
@@ -571,7 +583,7 @@ class DataManager:
                     "user_preferences": {}
                 }
         except Exception as e:
-            print(f"Error loading config: {e}")
+            st.error(f"Error loading config: {str(e)[:100]}")
             return {}
     
     def save_dataset(self, df: pd.DataFrame) -> bool:
@@ -581,7 +593,7 @@ class DataManager:
             self.employees_df = df
             return True
         except Exception as e:
-            print(f"Error saving dataset: {e}")
+            st.error(f"Error saving dataset: {str(e)[:100]}")
             return False
     
     def save_history(self) -> bool:
@@ -591,7 +603,7 @@ class DataManager:
                 json.dump(self.analysis_history, f, indent=2)
             return True
         except Exception as e:
-            print(f"Error saving history: {e}")
+            st.error(f"Error saving history: {str(e)[:100]}")
             return False
     
     def save_config(self) -> bool:
@@ -601,7 +613,7 @@ class DataManager:
                 json.dump(self.app_config, f, indent=2)
             return True
         except Exception as e:
-            print(f"Error saving config: {e}")
+            st.error(f"Error saving config: {str(e)[:100]}")
             return False
     
     def add_analysis(self, employee_data: Dict[str, Any], analysis_results: Dict[str, Any]) -> bool:
@@ -626,7 +638,7 @@ class DataManager:
             self.save_history()
             return True
         except Exception as e:
-            print(f"Error adding analysis: {e}")
+            st.error(f"Error adding analysis: {str(e)[:100]}")
             return False
     
     def update_statistics(self, analysis_record: Dict[str, Any]):
@@ -765,14 +777,14 @@ class PerformanceAnalyzer:
                 
                 # Try to parse as HH:MM
                 try:
-                    hours, minutes = map(int, time_str.split(':'))
-                    return hours + minutes / 60.0
-                except:
-                    # Try to parse as decimal
-                    try:
+                    if ':' in time_str:
+                        hours, minutes = map(int, time_str.split(':'))
+                        return hours + minutes / 60.0
+                    else:
+                        # Try to parse as decimal
                         return float(time_str)
-                    except:
-                        return None
+                except:
+                    return None
             
             in_time = parse_time(sign_in)
             out_time = parse_time(sign_out)
@@ -790,7 +802,7 @@ class PerformanceAnalyzer:
             return round(duration, 2)
             
         except Exception as e:
-            print(f"Error calculating work hours: {e}")
+            st.error(f"Error calculating work hours: {str(e)[:100]}")
             return AppConfig.DEFAULT_WORK_HOURS
     
     def analyze_employee(self, employee_data: Dict[str, Any], 
@@ -868,7 +880,7 @@ class PerformanceAnalyzer:
             return analysis_results
             
         except Exception as e:
-            print(f"Analysis error: {e}")
+            st.error(f"Analysis error: {str(e)[:100]}")
             return None
     
     def save_analysis_to_db(self, employee_data: Dict[str, Any], 
@@ -907,7 +919,7 @@ class PerformanceAnalyzer:
             return True
             
         except Exception as e:
-            print(f"Error saving to database: {e}")
+            st.error(f"Error saving to database: {str(e)[:100]}")
             return False
     
     def get_employee_performance_history(self, employee_name: str) -> List[Dict[str, Any]]:
@@ -1171,6 +1183,9 @@ class UIComponents:
     
     def create_performance_chart(self, performance_data: Dict[str, Any]):
         """Create performance chart"""
+        if not PLOTLY_AVAILABLE:
+            return None
+            
         metrics = ['Work Hours', 'Task Complexity', 'Engagement', 'Sentiment', 'Performance']
         values = [
             performance_data.get('components', {}).get('work_hours_score', 0),
@@ -1220,6 +1235,9 @@ class UIComponents:
     
     def create_sentiment_gauge(self, sentiment_score: float):
         """Create sentiment gauge chart"""
+        if not PLOTLY_AVAILABLE:
+            return None
+            
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
             value=sentiment_score * 100,
@@ -1251,7 +1269,7 @@ class UIComponents:
     
     def create_performance_trend_chart(self, history: List[Dict[str, Any]]):
         """Create performance trend chart"""
-        if not history:
+        if not PLOTLY_AVAILABLE or not history:
             return None
         
         dates = [h.get('date', '') for h in history]
@@ -1497,7 +1515,14 @@ class EmployeePerformanceApp:
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("No trend data available yet.")
+                    # Fallback to text display
+                    st.info("Performance trend visualization requires Plotly. Install with: pip install plotly")
+                    
+                    # Show recent activity as text
+                    if stats.get('recent_activity'):
+                        st.write("Recent Performance Scores:")
+                        for activity in stats['recent_activity']:
+                            st.write(f"- {activity.get('employee_name')}: {activity.get('performance_score')}/100")
             else:
                 st.info("No performance data available. Start by analyzing employees!")
             
@@ -1701,18 +1726,6 @@ class EmployeePerformanceApp:
                 type=['jpg', 'jpeg', 'png'],
                 help="Max 10MB • JPG, PNG"
             )
-            
-            # Preview buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                if video_file:
-                    if st.button("📹 Preview Video", use_container_width=True):
-                        st.video(video_file)
-            
-            with col2:
-                if image_file:
-                    if st.button("📸 Preview Image", use_container_width=True):
-                        st.image(image_file)
         
         with col3:
             st.markdown('<div class="subsection-header">🤖 AI Analysis Preview</div>', unsafe_allow_html=True)
@@ -1866,10 +1879,16 @@ class EmployeePerformanceApp:
         
         with col1:
             # Performance chart
-            st.plotly_chart(
-                self.ui.create_performance_chart(results['performance']),
-                use_container_width=True
-            )
+            chart = self.ui.create_performance_chart(results['performance'])
+            if chart:
+                st.plotly_chart(chart, use_container_width=True)
+            else:
+                # Fallback display
+                st.info("📊 Performance Metrics Breakdown")
+                components = results['performance']['components']
+                for key, value in components.items():
+                    st.write(f"**{key.replace('_', ' ').title()}:** {value}/100")
+                    st.progress(value / 100)
         
         with col2:
             # Detailed metrics
@@ -1920,10 +1939,17 @@ class EmployeePerformanceApp:
         
         with col1:
             # Sentiment gauge
-            st.plotly_chart(
-                self.ui.create_sentiment_gauge(results['ai_analysis']['sentiment']['score']),
-                use_container_width=True
-            )
+            gauge = self.ui.create_sentiment_gauge(results['ai_analysis']['sentiment']['score'])
+            if gauge:
+                st.plotly_chart(gauge, use_container_width=True)
+            else:
+                # Fallback display
+                sentiment = results['ai_analysis']['sentiment']
+                st.markdown(f"#### 😊 Sentiment Analysis")
+                st.write(f"**Sentiment:** {sentiment['sentiment']}")
+                st.write(f"**Score:** {sentiment['score']:.3f}")
+                st.write(f"**Positive Keywords:** {sentiment['positive_count']}")
+                st.write(f"**Negative Keywords:** {sentiment['negative_count']}")
             
             # Task complexity analysis
             st.markdown("#### 🧩 Task Complexity Analysis")
@@ -1932,11 +1958,6 @@ class EmployeePerformanceApp:
             st.write(f"**Score:** {complexity['score']:.3f}")
             st.write(f"**Word Count:** {complexity['word_count']}")
             st.write(f"**Technical Terms:** {complexity['technical_terms']}")
-            
-            if complexity['matched_factors']:
-                st.write("**Key Factors:**")
-                for factor, weight in list(complexity['matched_factors'].items())[:5]:
-                    st.write(f"  • {factor} (weight: {weight})")
         
         with col2:
             # AI Action Card
@@ -1985,31 +2006,7 @@ class EmployeePerformanceApp:
         
         # Display all recommendations
         for i, rec in enumerate(recommendations, 1):
-            st.markdown(f"#### {i}. {rec.get('icon', '💡')} **{rec.get('title')}**")
-            
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.write(rec.get('description'))
-            with col2:
-                priority_color = {
-                    'CRITICAL': self.config.COLORS['danger'],
-                    'HIGH': self.config.COLORS['warning'],
-                    'MEDIUM': self.config.COLORS['info'],
-                    'LOW': self.config.COLORS['text_secondary']
-                }.get(rec.get('priority', 'MEDIUM'), self.config.COLORS['info'])
-                
-                st.markdown(f"""
-                <div style="text-align: center;">
-                    <div style="color: {priority_color}; font-weight: bold; font-size: 0.9rem;">
-                        Priority: {rec.get('priority')}
-                    </div>
-                    <div style="color: {self.config.COLORS['text_secondary']}; font-size: 0.8rem;">
-                        Timeline: {rec.get('timeline')}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("---")
+            st.markdown(self.ui.create_recommendation_card(rec), unsafe_allow_html=True)
         
         # Action buttons
         col1, col2, col3 = st.columns(3)
@@ -2146,30 +2143,6 @@ class EmployeePerformanceApp:
         """Render dataset management page"""
         st.markdown(f'<div class="main-header">📁 Dataset Management</div>', unsafe_allow_html=True)
         
-        # Header with actions
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.markdown(f"""
-            <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
-                <button style="background-color: {self.config.COLORS['primary']}; color: white; 
-                           border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    📤 Upload CSV
-                </button>
-                <button style="background-color: {self.config.COLORS['success']}; color: white; 
-                           border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    ✏️ Add Manual Entry
-                </button>
-                <button style="background-color: {self.config.COLORS['info']}; color: white; 
-                           border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    🔄 Sync HR System
-                </button>
-                <button style="background-color: {self.config.COLORS['warning']}; color: white; 
-                           border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    📥 Export All
-                </button>
-            </div>
-            """, unsafe_allow_html=True)
-        
         # Upload section
         st.markdown('<div class="section-header">📤 Upload CSV File</div>', unsafe_allow_html=True)
         
@@ -2202,7 +2175,7 @@ class EmployeePerformanceApp:
                         st.rerun()
             
             except Exception as e:
-                st.error(f"❌ Error processing file: {e}")
+                st.error(f"❌ Error processing file: {str(e)[:100]}")
         
         st.markdown("---")
         
@@ -2217,18 +2190,6 @@ class EmployeePerformanceApp:
                 placeholder="Type employee name...",
                 key="employee_search"
             )
-        
-        with col2:
-            if st.button("Advanced Filters", use_container_width=True):
-                st.info("Advanced filters coming soon!")
-        
-        with col3:
-            if st.button("Date Range", use_container_width=True):
-                st.info("Date range selector coming soon!")
-        
-        with col4:
-            if st.button("Team", use_container_width=True):
-                st.info("Team filter coming soon!")
         
         # Data table
         if not self.data_manager.employees_df.empty:
@@ -2288,25 +2249,10 @@ class EmployeePerformanceApp:
                         # Get employee history
                         history = self.analyzer.get_employee_performance_history(selected)
                         if history:
-                            dates = [h['date'] for h in history[:6]]
-                            scores = [h['performance_score'] for h in history[:6]]
-                            
-                            fig = go.Figure(data=go.Scatter(
-                                x=dates, y=scores,
-                                mode='lines+markers',
-                                line=dict(color=self.config.COLORS['primary'], width=3),
-                                marker=dict(size=8)
-                            ))
-                            
-                            fig.update_layout(
-                                height=200,
-                                margin=dict(l=0, r=0, t=0, b=0),
-                                xaxis_title="Date",
-                                yaxis_title="Score",
-                                yaxis_range=[0, 100]
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
+                            # Simple text display of history
+                            st.write("Recent Performance Scores:")
+                            for h in history[:3]:
+                                st.write(f"- {h['date']}: {h['performance_score']}/100")
                         else:
                             st.info("No history available")
                         
@@ -2328,27 +2274,6 @@ class EmployeePerformanceApp:
     def render_reports(self):
         """Render reports page"""
         st.markdown(f'<div class="main-header">📊 Advanced Analytics & Reporting</div>', unsafe_allow_html=True)
-        
-        # Header with actions
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            st.markdown("""
-            <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
-                <button style="background-color: #2563EB; color: white; border: none; 
-                           padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    📈 Generate Custom Report
-                </button>
-                <button style="background-color: #10B981; color: white; border: none; 
-                           padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    📅 Schedule Reports
-                </button>
-                <button style="background-color: #F59E0B; color: white; border: none; 
-                           padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer;">
-                    📥 Export All Data
-                </button>
-            </div>
-            """, unsafe_allow_html=True)
         
         # Report builder
         st.markdown('<div class="section-header">🔧 Custom Report Builder</div>', unsafe_allow_html=True)
@@ -2390,7 +2315,7 @@ class EmployeePerformanceApp:
         # Visualization gallery
         st.markdown('<div class="section-header">📈 Visualization Gallery</div>', unsafe_allow_html=True)
         
-        if not self.data_manager.employees_df.empty:
+        if not self.data_manager.employees_df.empty and PLOTLY_AVAILABLE:
             # Create visualization grid
             col1, col2 = st.columns(2)
             
@@ -2407,32 +2332,11 @@ class EmployeePerformanceApp:
                         color_discrete_sequence=[self.config.COLORS['primary']]
                     )
                     st.plotly_chart(fig1, use_container_width=True)
-                
-                # Team performance comparison
-                st.markdown("#### 👥 Team Performance Comparison")
-                # Simulated team data
-                team_data = pd.DataFrame({
-                    'Team': ['Engineering', 'Sales', 'Marketing', 'HR', 'Support'],
-                    'Avg Performance': [85, 78, 72, 80, 75],
-                    'Avg Hours': [8.5, 9.2, 8.0, 7.8, 8.5],
-                    'Engagement': [82, 75, 70, 78, 72]
-                })
-                
-                fig3 = px.bar(
-                    team_data,
-                    x='Team',
-                    y=['Avg Performance', 'Avg Hours', 'Engagement'],
-                    barmode='group',
-                    title="Team Performance Metrics",
-                    color_discrete_sequence=[self.config.COLORS['primary'], 
-                                           self.config.COLORS['info'], 
-                                           self.config.COLORS['success']]
-                )
-                st.plotly_chart(fig3, use_container_width=True)
             
             with col2:
                 # Top AI actions
                 st.markdown("#### 🎯 Top AI Actions")
+                # Simulated AI actions data
                 ai_actions = pd.DataFrame({
                     'Action': ['Positive Feedback', 'Skill Training', 'Wellness Check', 
                               'Workload Adjust', 'No Action'],
@@ -2452,32 +2356,19 @@ class EmployeePerformanceApp:
                 )
                 fig2.update_traces(hole=0.3)
                 st.plotly_chart(fig2, use_container_width=True)
-                
-                # Performance trends over time
-                st.markdown("#### 📅 Performance Trends Over Time")
-                # Simulated time series data
-                dates = pd.date_range(start='2023-07-01', end='2023-12-31', freq='M')
-                trend_data = pd.DataFrame({
-                    'Date': dates,
-                    'Engineering': np.random.normal(85, 5, len(dates)),
-                    'Sales': np.random.normal(78, 7, len(dates)),
-                    'Marketing': np.random.normal(72, 6, len(dates)),
-                    'Company Avg': [80] * len(dates)
-                })
-                
-                fig4 = px.line(
-                    trend_data,
-                    x='Date',
-                    y=['Engineering', 'Sales', 'Marketing', 'Company Avg'],
-                    title="Monthly Performance Trends",
-                    labels={'value': 'Performance Score', 'variable': 'Team'},
-                    color_discrete_sequence=[self.config.COLORS['primary'], 
-                                           self.config.COLORS['success'],
-                                           self.config.COLORS['warning'],
-                                           self.config.COLORS['text_secondary']]
-                )
-                fig4.update_traces(line=dict(dash='dash'), selector=dict(name='Company Avg'))
-                st.plotly_chart(fig4, use_container_width=True)
+        
+        elif not self.data_manager.employees_df.empty:
+            st.info("📊 Data available for reporting. Install Plotly for visualizations: pip install plotly")
+            
+            # Show text statistics
+            st.markdown("#### 📊 Performance Statistics")
+            if 'performance_score' in self.data_manager.employees_df.columns:
+                scores = self.data_manager.employees_df['performance_score'].dropna()
+                if len(scores) > 0:
+                    st.write(f"**Average Score:** {scores.mean():.1f}/100")
+                    st.write(f"**Highest Score:** {scores.max():.1f}/100")
+                    st.write(f"**Lowest Score:** {scores.min():.1f}/100")
+                    st.write(f"**Number of Records:** {len(scores)}")
         
         else:
             st.info("No data available for visualizations. Please upload a dataset or analyze employees.")
@@ -2536,12 +2427,6 @@ class EmployeePerformanceApp:
             with col2:
                 if st.button("🧪 Test Model", use_container_width=True):
                     st.info("Test interface coming soon!")
-                
-                if st.button("🔄 Retrain", use_container_width=True):
-                    st.info("Retraining started...")
-                
-                if st.button("📊 View Details", use_container_width=True):
-                    st.info("Detailed metrics coming soon!")
             
             st.markdown("#### 📝 Sample Analysis")
             sample_input = "Completed project ahead of schedule with excellent feedback"
@@ -2561,9 +2446,6 @@ class EmployeePerformanceApp:
             with col2:
                 if st.button("📤 Upload Test Image", use_container_width=True):
                     st.info("Upload interface coming soon!")
-                
-                if st.button("🎚️ Adjust Sensitivity", use_container_width=True):
-                    st.info("Sensitivity adjustment coming soon!")
             
             st.markdown("#### 👁️ Live Demo")
             st.info("Face detection demo will be available in the next update.")
@@ -2581,43 +2463,47 @@ class EmployeePerformanceApp:
             with col2:
                 if st.button("🧠 Train on New Data", use_container_width=True):
                     st.info("Training started with new data...")
-                
-                if st.button("🔄 Reset Model", use_container_width=True):
-                    st.warning("Are you sure you want to reset the model?")
-                
-                if st.button("📊 Export Q-Table", use_container_width=True):
-                    st.info("Q-Table export coming soon!")
             
             st.markdown("#### 📈 Action Distribution")
             
-            # Action distribution chart
-            action_data = pd.DataFrame({
-                'Action': ['No Action', 'Positive Feedback', 'Skill Training', 
-                          'Wellness Check', 'Workload Adjust', 'Other'],
-                'Percentage': [15, 28, 22, 18, 12, 5],
-                'Color': [self.config.COLORS['text_secondary'], self.config.COLORS['success'],
-                         self.config.COLORS['primary'], self.config.COLORS['warning'],
-                         self.config.COLORS['info'], self.config.COLORS['ai_purple']]
-            })
-            
-            fig = px.bar(
-                action_data,
-                x='Percentage',
-                y='Action',
-                orientation='h',
-                title="AI Action Distribution",
-                color='Action',
-                color_discrete_map=dict(zip(action_data['Action'], action_data['Color']))
-            )
-            
-            fig.update_layout(
-                height=400,
-                xaxis_title="Percentage (%)",
-                yaxis_title="Action",
-                showlegend=False
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+            if PLOTLY_AVAILABLE:
+                # Action distribution chart
+                action_data = pd.DataFrame({
+                    'Action': ['No Action', 'Positive Feedback', 'Skill Training', 
+                              'Wellness Check', 'Workload Adjust', 'Other'],
+                    'Percentage': [15, 28, 22, 18, 12, 5],
+                    'Color': [self.config.COLORS['text_secondary'], self.config.COLORS['success'],
+                             self.config.COLORS['primary'], self.config.COLORS['warning'],
+                             self.config.COLORS['info'], self.config.COLORS['ai_purple']]
+                })
+                
+                fig = px.bar(
+                    action_data,
+                    x='Percentage',
+                    y='Action',
+                    orientation='h',
+                    title="AI Action Distribution",
+                    color='Action',
+                    color_discrete_map=dict(zip(action_data['Action'], action_data['Color']))
+                )
+                
+                fig.update_layout(
+                    height=400,
+                    xaxis_title="Percentage (%)",
+                    yaxis_title="Action",
+                    showlegend=False
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Action distribution visualization requires Plotly. Install with: pip install plotly")
+                st.write("**Action Distribution:**")
+                st.write("- Positive Feedback: 28%")
+                st.write("- Skill Training: 22%")
+                st.write("- Wellness Check: 18%")
+                st.write("- Workload Adjust: 12%")
+                st.write("- No Action: 15%")
+                st.write("- Other: 5%")
         
         # Training interface
         st.markdown("---")
@@ -2664,26 +2550,6 @@ class EmployeePerformanceApp:
                     time.sleep(0.02)
                 
                 st.success("✅ Training completed successfully!")
-        
-        # Training history
-        st.markdown("### 📚 Training History")
-        
-        history_data = [
-            {"Date": "2024-01-14", "Epochs": 50, "Accuracy": "+3.2%"},
-            {"Date": "2024-01-07", "Epochs": 100, "Accuracy": "+1.8%"},
-            {"Date": "2023-12-30", "Epochs": 200, "Accuracy": "+2.5%"},
-            {"Date": "2023-12-15", "Epochs": 50, "Accuracy": "+1.2%"}
-        ]
-        
-        for record in history_data:
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                st.write(f"**{record['Date']}**")
-            with col2:
-                st.write(f"{record['Epochs']} epochs")
-            with col3:
-                st.write(f"Accuracy: {record['Accuracy']}")
-            st.markdown("---")
     
     def render_settings(self):
         """Render settings page"""
@@ -2784,31 +2650,6 @@ class EmployeePerformanceApp:
             with export_col3:
                 if st.button("📥 Export as Excel", use_container_width=True):
                     self.export_as_excel()
-            
-            st.markdown("---")
-            
-            st.markdown("#### 🔄 Data Import")
-            
-            import_file = st.file_uploader(
-                "Import data from file",
-                type=['csv', 'json', 'xlsx'],
-                key="data_import"
-            )
-            
-            if import_file and st.button("📤 Import Data", type="primary"):
-                try:
-                    if import_file.name.endswith('.csv'):
-                        df = pd.read_csv(import_file)
-                    elif import_file.name.endswith('.json'):
-                        df = pd.read_json(import_file)
-                    else:
-                        df = pd.read_excel(import_file)
-                    
-                    self.data_manager.employees_df = df
-                    self.data_manager.save_dataset(df)
-                    st.success("Data imported successfully!")
-                except Exception as e:
-                    st.error(f"Import failed: {e}")
         
         with tab4:
             st.markdown("#### ℹ️ About This Application")
@@ -2849,19 +2690,26 @@ class EmployeePerformanceApp:
             
             st.markdown("#### 🛠️ System Information")
             
-            import sys
-            import platform
-            
             sys_info = {
                 "Python Version": sys.version.split()[0],
                 "Streamlit Version": st.__version__,
-                "Platform": platform.platform(),
-                "Processor": platform.processor(),
-                "System": platform.system()
+                "Plotly Available": PLOTLY_AVAILABLE
             }
             
             for key, value in sys_info.items():
                 st.write(f"**{key}:** {value}")
+            
+            # Installation instructions
+            st.markdown("---")
+            st.markdown("#### 📦 Installation")
+            
+            st.code("""
+# Install required packages
+pip install streamlit pandas numpy plotly
+
+# Run the application
+streamlit run app.py
+            """)
     
     def export_report(self):
         """Export current report"""
@@ -2940,20 +2788,10 @@ class EmployeePerformanceApp:
             dataset_backup = f"{backup_path}_dataset.csv"
             self.data_manager.employees_df.to_csv(dataset_backup, index=False)
             
-            # Backup history
-            history_backup = f"{backup_path}_history.json"
-            with open(history_backup, 'w') as f:
-                json.dump(self.data_manager.analysis_history, f, indent=2)
-            
-            # Backup config
-            config_backup = f"{backup_path}_config.json"
-            with open(config_backup, 'w') as f:
-                json.dump(self.data_manager.app_config, f, indent=2)
-            
-            st.success(f"✅ Backup created successfully at: {backup_path}*")
+            st.success(f"✅ Backup created successfully at: {backup_path}_dataset.csv")
             
         except Exception as e:
-            st.error(f"❌ Backup failed: {e}")
+            st.error(f"❌ Backup failed: {str(e)[:100]}")
     
     def clear_all_data(self):
         """Clear all application data"""
@@ -2975,7 +2813,7 @@ class EmployeePerformanceApp:
             st.rerun()
             
         except Exception as e:
-            st.error(f"❌ Error clearing data: {e}")
+            st.error(f"❌ Error clearing data: {str(e)[:100]}")
     
     def export_as_csv(self):
         """Export data as CSV"""
@@ -3033,7 +2871,7 @@ def main():
         app.run()
         
     except Exception as e:
-        st.error(f"Application error: {e}")
+        st.error(f"Application error: {str(e)[:200]}")
         st.info("Please refresh the page or contact support if the issue persists.")
 
 if __name__ == "__main__":
