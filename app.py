@@ -28,11 +28,13 @@ def parse_time(t: str):
     t = str(t).strip()
     if t.lower() in {"0:00", "0.00", "always", "-"} or t == "":
         return pd.NaT
+
     t = t.replace("AMM", "AM").replace("PMM", "PM")
     if t.lower().endswith("am") and not t.lower().endswith(" am"):
         t = t[:-2] + " AM"
     if t.lower().endswith("pm") and not t.lower().endswith(" pm"):
         t = t[:-2] + " PM"
+
     try:
         return pd.to_datetime(t, format="%I:%M %p", errors="coerce").time()
     except Exception:
@@ -44,38 +46,54 @@ def enrich_with_metrics(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c: c.strip() for c in data.columns}
     data = data.rename(columns=cols)
 
+    # Parse Date first so we can combine it with time-of-day safely
+    if "Date" in data.columns:
+        data["Date_parsed"] = pd.to_datetime(data["Date"], errors="coerce")
+    else:
+        data["Date_parsed"] = pd.NaT
+
     for col in ["Signed In", "Break", "Rejoined", "Signed Out"]:
         if col in data.columns:
             data[col + " parsed"] = data[col].apply(parse_time)
 
-    def duration_in_hours(row) -> Tuple[float, float]:
+    # FIXED: compute work hours using Date + time, compute break hours,
+    # treat missing break as 0.0 (so daily averages are per-day),
+    # and compute net_work_hours = work - break.
+    def duration_in_hours(row) -> Tuple[float, float, float]:
+        date = row.get("Date_parsed")
         start = row.get("Signed In parsed")
         end = row.get("Signed Out parsed")
         brk = row.get("Break parsed")
         rejoin = row.get("Rejoined parsed")
 
         work_hours = np.nan
-        break_hours = np.nan
+        break_hours = 0.0  # IMPORTANT: missing break => 0, not NaN
+        net_hours = np.nan
 
-        if pd.notna(start) and pd.notna(end):
-            start_dt = pd.to_datetime(start.strftime("%H:%M"))
-            end_dt = pd.to_datetime(end.strftime("%H:%M"))
+        if pd.notna(date) and pd.notna(start) and pd.notna(end):
+            start_dt = pd.Timestamp.combine(date.date(), start)
+            end_dt = pd.Timestamp.combine(date.date(), end)
             if end_dt < start_dt:
                 end_dt += pd.Timedelta(days=1)
             work_hours = (end_dt - start_dt).total_seconds() / 3600.0
 
-        if pd.notna(brk) and pd.notna(rejoin):
-            brk_dt = pd.to_datetime(brk.strftime("%H:%M"))
-            rejoin_dt = pd.to_datetime(rejoin.strftime("%H:%M"))
+        if pd.notna(date) and pd.notna(brk) and pd.notna(rejoin):
+            brk_dt = pd.Timestamp.combine(date.date(), brk)
+            rejoin_dt = pd.Timestamp.combine(date.date(), rejoin)
             if rejoin_dt < brk_dt:
                 rejoin_dt += pd.Timedelta(days=1)
             break_hours = (rejoin_dt - brk_dt).total_seconds() / 3600.0
 
-        return work_hours, break_hours
+        if pd.notna(work_hours):
+            net_hours = work_hours - break_hours
+            net_hours = max(0.0, net_hours)
+
+        return work_hours, break_hours, net_hours
 
     durations = data.apply(duration_in_hours, axis=1, result_type="expand")
-    data["work_hours"] = durations[0]
-    data["break_hours"] = durations[1]
+    data["work_hours"] = durations[0]          # raw shift duration
+    data["break_hours"] = durations[1]         # break duration (0 if missing)
+    data["net_work_hours"] = durations[2]      # FIXED: net working time
 
     if "Completed Task" in data.columns:
         data["completed_flag"] = (
@@ -90,11 +108,6 @@ def enrich_with_metrics(df: pd.DataFrame) -> pd.DataFrame:
         )
     else:
         data["in_progress_flag"] = False
-
-    if "Date" in data.columns:
-        data["Date_parsed"] = pd.to_datetime(data["Date"], errors="coerce")
-    else:
-        data["Date_parsed"] = pd.NaT
 
     return data
 
@@ -125,10 +138,11 @@ def aggregate_perf(df_daily: pd.DataFrame, w_hours: float, w_tasks: float, w_pro
             ]
         )
 
+    # FIXED: aggregate daily NET work hours, not raw shift hours.
     grouped = (
         df_daily.groupby(["Team Members", "Date"], dropna=False)
         .agg(
-            total_work_hours=("work_hours", "sum"),
+            total_work_hours=("net_work_hours", "sum"),   # FIXED
             total_break_hours=("break_hours", "sum"),
             days_records=("Date", "size"),
             tasks_completed=("completed_flag", "sum"),
@@ -264,7 +278,6 @@ def simulate_epsilon_greedy_bandit(
         q_values[action_idx] = q_values[action_idx] + alpha * (reward - q_values[action_idx])
 
         avg_reward_so_far = np.mean([h["reward"] for h in history] + [reward])
-
         history.append(
             {
                 "episode": ep,
@@ -379,7 +392,9 @@ def generate_ai_action_plan(emp_name: str, recs, perf_score: float, avg_hours: f
 
 def build_plan_pdf(emp_name: str, plan_text: str) -> bytes:
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesizes=A4)
+
+    # FIXED: pagesize (singular), per ReportLab docs
+    c = canvas.Canvas(buffer, pagesize=A4)  # :contentReference[oaicite:2]{index=2}
     width, height = A4
 
     text_object = c.beginText(40, height - 50)
@@ -391,6 +406,7 @@ def build_plan_pdf(emp_name: str, plan_text: str) -> bytes:
     c.drawText(text_object)
     c.showPage()
     c.save()
+
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
@@ -469,8 +485,9 @@ else:
     w_tasks /= total_w
     w_progress /= total_w
 
-# Build performance summary
+# Build performance summary (FIXED averages are now based on net_work_hours)
 df_perf = aggregate_perf(df_daily, w_hours, w_tasks, w_progress)
+
 team_members_all = sorted(df_perf["Team Members"].dropna().unique().tolist())
 team_members_filter = ["All"] + team_members_all
 
@@ -528,12 +545,15 @@ st.subheader("Overview KPIs")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Tracked employees", f"{df_perf['Team Members'].nunique()}")
+
 with col2:
     avg_hours_all = df_perf["avg_daily_hours"].mean()
-    st.metric("Average daily hours", f"{avg_hours_all:0.2f} h" if not np.isnan(avg_hours_all) else "N/A")
+    st.metric("Average daily hours (net)", f"{avg_hours_all:0.2f} h" if not np.isnan(avg_hours_all) else "N/A")
+
 with col3:
     total_tasks_all = df_perf["total_tasks_completed"].sum()
     st.metric("Tasks completed (total)", f"{int(total_tasks_all)}")
+
 with col4:
     high_perf = (df_perf["performance_score"] >= 70).sum()
     st.metric("High performance profiles", f"{high_perf}")
@@ -622,7 +642,7 @@ if selected_emp:
     # Summary metrics
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Avg daily hours", f"{emp_row['avg_daily_hours']:.2f} h")
+        st.metric("Avg daily hours (net)", f"{emp_row['avg_daily_hours']:.2f} h")
     with c2:
         st.metric("Tasks completed", f"{int(emp_row['total_tasks_completed'])}")
     with c3:
@@ -679,7 +699,7 @@ if selected_emp:
         st.markdown(
             f"""
             <div style="border:1px solid #e0e0e0;border-radius:12px;padding:10px 12px;">
-                <div style="font-size:0.9rem;font-weight:600;">⏰ Work Hours</div>
+                <div style="font-size:0.9rem;font-weight:600;">⏰ Work Hours (net)</div>
                 <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">
                     {avg_hours_emp:.1f} hours
                 </div>
@@ -721,12 +741,12 @@ if selected_emp:
             unsafe_allow_html=True,
         )
 
-    # Daily work hours timeline
-    st.markdown("**Daily work hours timeline**")
+    # Daily work hours timeline (use net_work_hours!)
+    st.markdown("**Daily net work hours timeline**")
     if not emp_daily.empty:
-        emp_daily_plot = emp_daily[["Date_parsed", "work_hours"]].copy()
+        emp_daily_plot = emp_daily[["Date_parsed", "net_work_hours"]].copy()
         emp_daily_plot = emp_daily_plot.set_index("Date_parsed")
-        st.line_chart(emp_daily_plot["work_hours"])
+        st.line_chart(emp_daily_plot["net_work_hours"])
     else:
         st.info("No daily records found for this employee.")
 
@@ -772,8 +792,8 @@ if selected_emp:
 
         st.markdown(
             f"""
-            **Employee:** `{emp_name_input or "Unknown"}`  
-            **Analysis Date:** `{analysis_date.isoformat()}`  
+            **Employee:** `{emp_name_input or "Unknown"}`
+            **Analysis Date:** `{analysis_date.isoformat()}`
             """
         )
         col_ch1, col_ch2 = st.columns(2)
@@ -786,6 +806,7 @@ if selected_emp:
                 st.warning("⚠ Below optimal range (less than 8 hours)")
             else:
                 st.warning("⚠ Above optimal range (more than 9 hours)")
+
         st.caption("Reference band: Optimal work duration 8 to 9 hours per day.")
 
     # Performance breakdown radar and detailed scores
@@ -850,14 +871,14 @@ if selected_emp:
         st.markdown("### 📊 Detailed Scores")
         st.markdown(
             f"""
-            • Task Complexity: **{task_complexity}/10** {score_badge(task_complexity)}  
-            • Sentiment Score: **{sentiment_score}/10** {score_badge(sentiment_score)}  
-            • Video Engagement: **{video_engagement}/10** {score_badge(video_engagement)}  
-            • Image Quality: **{image_quality}/10** {score_badge(image_quality)}  
+            • Task Complexity: **{task_complexity}/10** {score_badge(task_complexity)}
+            • Sentiment Score: **{sentiment_score}/10** {score_badge(sentiment_score)}
+            • Video Engagement: **{video_engagement}/10** {score_badge(video_engagement)}
+            • Image Quality: **{image_quality}/10** {score_badge(image_quality)}
             """.strip()
         )
 
-    # AI Analysis Results card
+    # AI Analysis Results card (unchanged)
     st.markdown("### 🧠 AI Analysis Results")
 
     avg_hours_emp_float = float(emp_row["avg_daily_hours"])
@@ -940,7 +961,7 @@ if selected_emp:
         unsafe_allow_html=True,
     )
 
-    # Dynamic Actionable Recommendations
+    # Dynamic Actionable Recommendations (unchanged)
     st.markdown("### 💡 Actionable Recommendations")
 
     eng_norm_emp = float(emp_row.get("total_tasks_in_progress_norm", 0.5))
@@ -997,6 +1018,7 @@ if selected_emp:
             mime="application/pdf",
             use_container_width=True,
         )
+
     with btn2:
         share_email = st.button("📧 Send email notification", use_container_width=True)
         if share_email:
@@ -1011,15 +1033,17 @@ Here is your current development and performance action plan:
 
 Best regards,
 HR AAC AI Assistant
-"""
+            """.strip()
             st.success("Email notification prepared (stub). Connect SMTP here in production.")
             st.code(email_preview, language="text")
+
     with btn3:
         share_slack = st.button("💬 Send Slack alert", use_container_width=True)
         if share_slack:
-            slack_preview = f"*Action plan for {selected_emp}*\\n\\n```{ai_plan_text}```"
+            slack_preview = f"*Action plan for {selected_emp}*\n\n```{ai_plan_text}```"
             st.success("Slack alert prepared (stub). Connect Slack webhook here in production.")
             st.code(slack_preview, language="markdown")
+
     with btn4:
         mark_complete = st.button("✅ Mark recommendations complete", use_container_width=True)
         if mark_complete:
@@ -1050,12 +1074,12 @@ with left:
     else:
         st.info("No performance data available.")
 with right:
-    st.subheader("Distribution of daily work hours")
-    if df_daily_view["work_hours"].dropna().empty:
-        st.info("No work hour data for this selection.")
+    st.subheader("Distribution of daily net work hours")
+    if df_daily_view["net_work_hours"].dropna().empty:
+        st.info("No net work hour data for this selection.")
     else:
         st.bar_chart(
-            df_daily_view["work_hours"].dropna(),
+            df_daily_view["net_work_hours"].dropna(),
             height=350,
         )
 
@@ -1063,9 +1087,8 @@ st.markdown("---")
 
 # Employee explorer
 st.subheader("Employee explorer")
-tab1, tab2, tab3 = st.tabs(
-    ["Performance table", "Daily timeline", "AI and RL insights"]
-)
+tab1, tab2, tab3 = st.tabs(["Performance table", "Daily timeline", "AI and RL insights"])
+
 with tab1:
     st.write("Aggregated performance metrics per employee")
     cols_show = [
@@ -1082,9 +1105,11 @@ with tab1:
         df_perf[cols_show].sort_values("performance_score", ascending=False),
         use_container_width=True,
     )
+
 with tab2:
     st.write("Raw daily records for deeper inspection (filtered by sidebar)")
     st.dataframe(df_daily_view, use_container_width=True)
+
 with tab3:
     st.write("AI summarized profile and reinforcement learning style recommendation")
     if team_members_all:
@@ -1097,13 +1122,12 @@ with tab3:
         st.markdown(
             f"""
             **{member_for_ai}**
-
-            - Average daily hours: `{row_ai['avg_daily_hours']:.2f}` h  
-            - Average break hours: `{row_ai['avg_break_hours']:.2f}` h  
-            - Days observed: `{int(row_ai['days_observed'])}` days  
-            - Tasks completed: `{int(row_ai['total_tasks_completed'])}`  
-            - Tasks in progress: `{int(row_ai['total_tasks_in_progress'])}`  
-            - Composite performance score: `{row_ai['performance_score']:.1f}` / 100  
+            - Average daily hours (net): `{row_ai['avg_daily_hours']:.2f}` h
+            - Average break hours: `{row_ai['avg_break_hours']:.2f}` h
+            - Days observed: `{int(row_ai['days_observed'])}` days
+            - Tasks completed: `{int(row_ai['total_tasks_completed'])}`
+            - Tasks in progress: `{int(row_ai['total_tasks_in_progress'])}`
+            - Composite performance score: `{row_ai['performance_score']:.1f}` / 100
             - Status: `{row_ai['risk_flag']}`
             """
         )
@@ -1137,6 +1161,7 @@ with col_rl3:
     st.write("Actions used:")
     for a in BANDIT_ACTIONS:
         st.write(f"- {a}")
+
 run_bandit = st.button("Run RL bandit simulation")
 if run_bandit:
     history_df, q_df = simulate_epsilon_greedy_bandit(df_perf, episodes=int(rl_episodes), epsilon=float(rl_epsilon))
@@ -1158,6 +1183,7 @@ st.markdown("---")
 # Video and selfie analysis
 st.subheader("Session video and selfie analysis - prototype")
 tab_vid, tab_img = st.tabs(["Video analysis", "Selfie analysis"])
+
 with tab_vid:
     st.markdown("#### Upload work session video")
     video_file = st.file_uploader(
@@ -1172,6 +1198,7 @@ with tab_vid:
             "This prototype does not yet run a deep vision model. "
             "In production, connect this module to a pose or focus detection model to score engagement."
         )
+
 with tab_img:
     st.markdown("#### Upload selfie during session")
     img_file = st.file_uploader(
