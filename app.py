@@ -1,3 +1,5 @@
+# app.py  (SINGLE FILE)
+
 import pathlib
 from typing import Tuple, Dict, List
 from io import BytesIO
@@ -8,6 +10,16 @@ import streamlit as st
 import plotly.graph_objects as go
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+
+# Optional real-time camera deps (we handle missing installs gracefully)
+REALTIME_AVAILABLE = True
+try:
+    import av
+    import cv2
+    import mediapipe as mp
+    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+except Exception:
+    REALTIME_AVAILABLE = False
 
 
 # -----------------------------
@@ -56,9 +68,10 @@ def enrich_with_metrics(df: pd.DataFrame) -> pd.DataFrame:
         if col in data.columns:
             data[col + " parsed"] = data[col].apply(parse_time)
 
-    # FIXED: compute work hours using Date + time, compute break hours,
-    # treat missing break as 0.0 (so daily averages are per-day),
-    # and compute net_work_hours = work - break.
+    # FIXED:
+    # - Use Date + time to build proper datetimes
+    # - break_hours defaults to 0.0 when missing (prevents NaN-biased means)
+    # - net_work_hours = work_hours - break_hours
     def duration_in_hours(row) -> Tuple[float, float, float]:
         date = row.get("Date_parsed")
         start = row.get("Signed In parsed")
@@ -67,7 +80,7 @@ def enrich_with_metrics(df: pd.DataFrame) -> pd.DataFrame:
         rejoin = row.get("Rejoined parsed")
 
         work_hours = np.nan
-        break_hours = 0.0  # IMPORTANT: missing break => 0, not NaN
+        break_hours = 0.0
         net_hours = np.nan
 
         if pd.notna(date) and pd.notna(start) and pd.notna(end):
@@ -91,9 +104,9 @@ def enrich_with_metrics(df: pd.DataFrame) -> pd.DataFrame:
         return work_hours, break_hours, net_hours
 
     durations = data.apply(duration_in_hours, axis=1, result_type="expand")
-    data["work_hours"] = durations[0]          # raw shift duration
-    data["break_hours"] = durations[1]         # break duration (0 if missing)
-    data["net_work_hours"] = durations[2]      # FIXED: net working time
+    data["work_hours"] = durations[0]       # raw shift duration
+    data["break_hours"] = durations[1]      # 0 if missing
+    data["net_work_hours"] = durations[2]   # FIXED net work
 
     if "Completed Task" in data.columns:
         data["completed_flag"] = (
@@ -138,12 +151,11 @@ def aggregate_perf(df_daily: pd.DataFrame, w_hours: float, w_tasks: float, w_pro
             ]
         )
 
-    # FIXED: aggregate daily NET work hours, not raw shift hours.
     grouped = (
         df_daily.groupby(["Team Members", "Date"], dropna=False)
         .agg(
-            total_work_hours=("net_work_hours", "sum"),   # FIXED
-            total_break_hours=("break_hours", "sum"),
+            total_work_hours=("net_work_hours", "sum"),  # FIXED: net hours
+            total_break_hours=("break_hours", "sum"),    # break already 0 if missing
             days_records=("Date", "size"),
             tasks_completed=("completed_flag", "sum"),
             tasks_in_progress=("in_progress_flag", "sum"),
@@ -393,8 +405,8 @@ def generate_ai_action_plan(emp_name: str, recs, perf_score: float, avg_hours: f
 def build_plan_pdf(emp_name: str, plan_text: str) -> bytes:
     buffer = BytesIO()
 
-    # FIXED: pagesize (singular), per ReportLab docs
-    c = canvas.Canvas(buffer, pagesize=A4)  # :contentReference[oaicite:2]{index=2}
+    # FIXED: pagesize is the correct argument name
+    c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
     text_object = c.beginText(40, height - 50)
@@ -410,6 +422,33 @@ def build_plan_pdf(emp_name: str, plan_text: str) -> bytes:
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
+
+
+# -----------------------------
+# Real-time Camera (Face Detection)
+# -----------------------------
+if REALTIME_AVAILABLE:
+    mp_face = mp.solutions.face_detection
+    mp_draw = mp.solutions.drawing_utils
+
+    @st.cache_resource
+    def get_face_detector():
+        return mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.6)
+
+    class FaceDetectionTransformer(VideoTransformerBase):
+        def __init__(self):
+            self.detector = get_face_detector()
+
+        def transform(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+            img = frame.to_ndarray(format="bgr24")
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.detector.process(img_rgb)
+
+            if results.detections:
+                for det in results.detections:
+                    mp_draw.draw_detection(img, det)
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # -----------------------------
@@ -485,7 +524,7 @@ else:
     w_tasks /= total_w
     w_progress /= total_w
 
-# Build performance summary (FIXED averages are now based on net_work_hours)
+# Build performance summary
 df_perf = aggregate_perf(df_daily, w_hours, w_tasks, w_progress)
 
 team_members_all = sorted(df_perf["Team Members"].dropna().unique().tolist())
@@ -541,8 +580,8 @@ st.markdown("---")
 
 # Overview KPIs
 st.subheader("Overview KPIs")
-
 col1, col2, col3, col4 = st.columns(4)
+
 with col1:
     st.metric("Tracked employees", f"{df_perf['Team Members'].nunique()}")
 
@@ -652,12 +691,7 @@ if selected_emp:
 
     # Compact 4-card summary
     perf_score = emp_row["performance_score"]
-    if perf_score >= 85:
-        priority_label = "High Priority"
-    elif perf_score < 60:
-        priority_label = "Low Priority"
-    else:
-        priority_label = "Medium Priority"
+    priority_label = "High Priority" if perf_score >= 85 else ("Low Priority" if perf_score < 60 else "Medium Priority")
 
     avg_hours_emp = emp_row["avg_daily_hours"]
     if 8.0 <= avg_hours_emp <= 9.0:
@@ -669,12 +703,7 @@ if selected_emp:
 
     engagement_norm_emp = float(emp_row.get("total_tasks_in_progress_norm", 0.5))
     engagement_score = int(round(engagement_norm_emp * 100))
-    if engagement_score >= 75:
-        engagement_label = "Good"
-    elif engagement_score >= 50:
-        engagement_label = "Needs Improvement"
-    else:
-        engagement_label = "Low"
+    engagement_label = "Good" if engagement_score >= 75 else ("Needs Improvement" if engagement_score >= 50 else "Low")
 
     emp_state = simple_state_from_row(emp_row)
     ai_action = rl_policy(emp_state)
@@ -685,12 +714,8 @@ if selected_emp:
             f"""
             <div style="border:1px solid #e0e0e0;border-radius:12px;padding:10px 12px;">
                 <div style="font-size:0.9rem;font-weight:600;">🎯 Performance</div>
-                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">
-                    {perf_score:.1f}/100
-                </div>
-                <div style="font-size:0.8rem;color:#666;margin-top:4px;">
-                    {priority_label}
-                </div>
+                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">{perf_score:.1f}/100</div>
+                <div style="font-size:0.8rem;color:#666;margin-top:4px;">{priority_label}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -700,12 +725,8 @@ if selected_emp:
             f"""
             <div style="border:1px solid #e0e0e0;border-radius:12px;padding:10px 12px;">
                 <div style="font-size:0.9rem;font-weight:600;">⏰ Work Hours (net)</div>
-                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">
-                    {avg_hours_emp:.1f} hours
-                </div>
-                <div style="font-size:0.8rem;color:#666;margin-top:4px;">
-                    {hours_label}
-                </div>
+                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">{avg_hours_emp:.1f} hours</div>
+                <div style="font-size:0.8rem;color:#666;margin-top:4px;">{hours_label}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -715,12 +736,8 @@ if selected_emp:
             f"""
             <div style="border:1px solid #e0e0e0;border-radius:12px;padding:10px 12px;">
                 <div style="font-size:0.9rem;font-weight:600;">💡 Engagement</div>
-                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">
-                    {engagement_score}/100
-                </div>
-                <div style="font-size:0.8rem;color:#666;margin-top:4px;">
-                    {engagement_label}
-                </div>
+                <div style="font-size:1.2rem;font-weight:700;margin-top:4px;">{engagement_score}/100</div>
+                <div style="font-size:0.8rem;color:#666;margin-top:4px;">{engagement_label}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -730,56 +747,33 @@ if selected_emp:
             f"""
             <div style="border:1px solid #e0e0e0;border-radius:12px;padding:10px 12px;">
                 <div style="font-size:0.9rem;font-weight:600;">🤖 AI Action</div>
-                <div style="font-size:1.0rem;font-weight:700;margin-top:4px;">
-                    {ai_action.split('.')[0]}
-                </div>
-                <div style="font-size:0.8rem;color:#666;margin-top:4px;">
-                    Recommended
-                </div>
+                <div style="font-size:1.0rem;font-weight:700;margin-top:4px;">{ai_action.split('.')[0]}</div>
+                <div style="font-size:0.8rem;color:#666;margin-top:4px;">Recommended</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    # Daily work hours timeline (use net_work_hours!)
+    # Daily NET work hours timeline
     st.markdown("**Daily net work hours timeline**")
     if not emp_daily.empty:
-        emp_daily_plot = emp_daily[["Date_parsed", "net_work_hours"]].copy()
-        emp_daily_plot = emp_daily_plot.set_index("Date_parsed")
+        emp_daily_plot = emp_daily[["Date_parsed", "net_work_hours"]].copy().set_index("Date_parsed")
         st.line_chart(emp_daily_plot["net_work_hours"])
     else:
         st.info("No daily records found for this employee.")
 
     # Employee details manual analysis
     st.subheader("📋 Employee Details")
-
     with st.form("employee_details_form"):
         col_ed1, col_ed2 = st.columns(2)
         with col_ed1:
-            emp_name_input = st.text_input(
-                "Employee Name",
-                value=selected_emp,
-                placeholder="e.g., John Davis",
-            )
-            if df_daily["Date_parsed"].notna().any():
-                default_date = df_daily["Date_parsed"].max().date()
-            else:
-                import datetime as _dt
-                default_date = _dt.date.today()
-            analysis_date = st.date_input(
-                "Analysis Date",
-                value=default_date,
-            )
+            emp_name_input = st.text_input("Employee Name", value=selected_emp, placeholder="e.g., John Davis")
+            default_date = df_daily["Date_parsed"].max().date() if df_daily["Date_parsed"].notna().any() else pd.Timestamp.today().date()
+            analysis_date = st.date_input("Analysis Date", value=default_date)
         with col_ed2:
             import datetime as _dt
-            sign_in_time = st.time_input(
-                "Sign In (24h)",
-                value=_dt.time(9, 0),
-            )
-            sign_out_time = st.time_input(
-                "Sign Out (24h)",
-                value=_dt.time(17, 30),
-            )
+            sign_in_time = st.time_input("Sign In (24h)", value=_dt.time(9, 0))
+            sign_out_time = st.time_input("Sign Out (24h)", value=_dt.time(17, 30))
         submitted_details = st.form_submit_button("Calculate Hours")
 
     if submitted_details:
@@ -790,12 +784,7 @@ if selected_emp:
             end_dt += _dt.timedelta(days=1)
         total_hours = (end_dt - start_dt).total_seconds() / 3600.0
 
-        st.markdown(
-            f"""
-            **Employee:** `{emp_name_input or "Unknown"}`
-            **Analysis Date:** `{analysis_date.isoformat()}`
-            """
-        )
+        st.markdown(f"**Employee:** `{emp_name_input or 'Unknown'}`  \n**Analysis Date:** `{analysis_date.isoformat()}`")
         col_ch1, col_ch2 = st.columns(2)
         with col_ch1:
             st.metric("⏰ Calculated Hours", f"{total_hours:.1f} hours")
@@ -806,10 +795,9 @@ if selected_emp:
                 st.warning("⚠ Below optimal range (less than 8 hours)")
             else:
                 st.warning("⚠ Above optimal range (more than 9 hours)")
-
         st.caption("Reference band: Optimal work duration 8 to 9 hours per day.")
 
-    # Performance breakdown radar and detailed scores
+    # Performance breakdown radar
     st.markdown("### 📈 Performance Breakdown")
     task_completion_score = float(emp_row.get("total_tasks_completed_norm", 0.5)) * 100
     engagement_score_radar = float(emp_row.get("total_tasks_in_progress_norm", 0.5)) * 100
@@ -817,20 +805,8 @@ if selected_emp:
     collaboration_score = min(100.0, max(0.0, perf_score - 5))
     innovation_score = min(100.0, max(0.0, perf_score * 0.9))
 
-    radar_categories = [
-        "Task Completion",
-        "Work Quality",
-        "Engagement",
-        "Collaboration",
-        "Innovation",
-    ]
-    radar_values = [
-        task_completion_score,
-        work_quality_score,
-        engagement_score_radar,
-        collaboration_score,
-        innovation_score,
-    ]
+    radar_categories = ["Task Completion", "Work Quality", "Engagement", "Collaboration", "Innovation"]
+    radar_values = [task_completion_score, work_quality_score, engagement_score_radar, collaboration_score, innovation_score]
 
     radar_fig = go.Figure(
         data=go.Scatterpolar(
@@ -840,12 +816,7 @@ if selected_emp:
         )
     )
     radar_fig.update_layout(
-        polar=dict(
-            radialaxis=dict(
-                visible=True,
-                range=[0, 100],
-            )
-        ),
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
         showlegend=False,
         margin=dict(l=20, r=20, t=20, b=20),
     )
@@ -878,100 +849,10 @@ if selected_emp:
             """.strip()
         )
 
-    # AI Analysis Results card (unchanged)
-    st.markdown("### 🧠 AI Analysis Results")
-
-    avg_hours_emp_float = float(emp_row["avg_daily_hours"])
-    perf_tag = "low_perf"
-    if perf_score >= 80:
-        perf_tag = "high_perf"
-    elif perf_score >= 60:
-        perf_tag = "med_perf"
-
-    hrs_tag = "low_hrs"
-    if avg_hours_emp_float >= 8.0:
-        hrs_tag = "normal_hrs"
-    elif avg_hours_emp_float >= 10.0:
-        hrs_tag = "high_hrs"
-
-    eng_tag = "high_eng" if engagement_norm_emp >= 0.7 else ("med_eng" if engagement_norm_emp >= 0.4 else "low_eng")
-    symbolic_state = f"[{perf_tag}, {hrs_tag}, {eng_tag}]"
-
-    confidence = int(min(95, max(60, perf_score * 0.9)))
-    expected_impact = int(max(5, min(20, (80 - perf_score) / 2 + 10)))
-    q_value_main = round(0.6 + (perf_score / 200.0), 2)
-    alt1_value = round(q_value_main - 0.13, 2)
-    alt2_value = round(q_value_main - 0.19, 2)
-
-    face_detected_conf = 92
-    video_qual_text = "Medium motion, consistent focus"
-    workspace_text = "Well lit, organized"
-
-    st.markdown(
-        f"""
-        <div style="
-            border-radius: 14px;
-            padding: 16px 18px;
-            background: linear-gradient(135deg, #7e57c2 0%, #5c6bc0 50%, #3949ab 100%);
-            color: #fff;
-            box-shadow: 0 6px 16px rgba(0,0,0,0.15);
-        ">
-            <h4 style="margin: 0 0 12px 0; font-size: 1.1rem;">
-                🧠 AI Analysis Results
-            </h4>
-            <div style="margin-bottom: 14px;">
-                <strong>🎯 Recommended Action:</strong>
-                <span style="font-weight:700; letter-spacing:0.5px;">
-                    {ai_action.split('.')[0].upper()}
-                </span><br/>
-                <span>Confidence: <strong>{confidence}%</strong></span><br/>
-                <span>Reason: High task complexity with medium performance</span><br/>
-                <span>Expected Impact: <strong>+{expected_impact}%</strong> performance improvement</span>
-            </div>
-
-            <div style="
-                border-top: 1px solid rgba(255,255,255,0.25);
-                margin: 10px 0;
-                padding-top: 10px;
-                font-size: 0.92rem;
-            ">
-                <strong>📊 RL Agent Insights</strong><br/>
-                • State: <code style="background:rgba(0,0,0,0.15); padding:2px 6px; border-radius:4px;">
-                    {symbolic_state}
-                  </code><br/>
-                • Q-Value: <strong>{q_value_main}</strong><br/>
-                • Alternative Actions:
-                  Positive Feedback (<strong>{alt1_value}</strong>),
-                  Wellness Check (<strong>{alt2_value}</strong>)
-            </div>
-
-            <div style="
-                border-top: 1px solid rgba(255,255,255,0.25);
-                margin: 10px 0 0 0;
-                padding-top: 10px;
-                font-size: 0.92rem;
-            ">
-                <strong>🔍 Multimodal Analysis</strong><br/>
-                • Face Detected: ✅ Yes (confidence: {face_detected_conf}%)<br/>
-                • Video Engagement: {video_qual_text}<br/>
-                • Workspace Quality: {workspace_text}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Dynamic Actionable Recommendations (unchanged)
+    # Recommendations + PDF export
     st.markdown("### 💡 Actionable Recommendations")
-
     eng_norm_emp = float(emp_row.get("total_tasks_in_progress_norm", 0.5))
-    recommendations = build_dynamic_recommendations(
-        selected_emp,
-        perf_score,
-        avg_hours_emp_float,
-        eng_norm_emp,
-        ai_action,
-    )
+    recommendations = build_dynamic_recommendations(selected_emp, perf_score, float(emp_row["avg_daily_hours"]), eng_norm_emp, ai_action)
 
     rec_html_parts = []
     rec_html_parts.append('<div style="border-radius: 12px; padding: 16px 20px; border: 1px solid #e0e0e0; background: #fafafa; line-height: 1.55;">')
@@ -987,101 +868,39 @@ if selected_emp:
             </li>
             """
         )
-    rec_html_parts.append("</ol>")
-    rec_html_parts.append("</div>")
-
+    rec_html_parts.append("</ol></div>")
     st.markdown("\n".join(rec_html_parts), unsafe_allow_html=True)
 
-    ai_plan_text = generate_ai_action_plan(
-        selected_emp,
-        recommendations,
-        perf_score,
-        avg_hours_emp_float,
-        eng_norm_emp,
-    )
-
+    ai_plan_text = generate_ai_action_plan(selected_emp, recommendations, perf_score, float(emp_row["avg_daily_hours"]), eng_norm_emp)
     st.markdown("#### 📝 AI generated action plan (prototype)")
-    st.text_area(
-        "Action plan details",
-        value=ai_plan_text,
-        height=250,
-    )
+    st.text_area("Action plan details", value=ai_plan_text, height=250)
 
     pdf_bytes = build_plan_pdf(selected_emp, ai_plan_text)
-
-    btn1, btn2, btn3, btn4 = st.columns(4)
-    with btn1:
-        st.download_button(
-            "📄 Export plan as PDF",
-            data=pdf_bytes,
-            file_name=f"{selected_emp.replace(' ', '_')}_action_plan.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-
-    with btn2:
-        share_email = st.button("📧 Send email notification", use_container_width=True)
-        if share_email:
-            email_preview = f"""
-Subject: Action plan for {selected_emp}
-
-Hi {selected_emp},
-
-Here is your current development and performance action plan:
-
-{ai_plan_text}
-
-Best regards,
-HR AAC AI Assistant
-            """.strip()
-            st.success("Email notification prepared (stub). Connect SMTP here in production.")
-            st.code(email_preview, language="text")
-
-    with btn3:
-        share_slack = st.button("💬 Send Slack alert", use_container_width=True)
-        if share_slack:
-            slack_preview = f"*Action plan for {selected_emp}*\n\n```{ai_plan_text}```"
-            st.success("Slack alert prepared (stub). Connect Slack webhook here in production.")
-            st.code(slack_preview, language="markdown")
-
-    with btn4:
-        mark_complete = st.button("✅ Mark recommendations complete", use_container_width=True)
-        if mark_complete:
-            st.success("Marked as completed for this session. Persist this in a database in production.")
-
-    # Per employee CSV export
-    emp_report = emp_daily.copy()
-    emp_report["performance_score"] = emp_row["performance_score"]
-    csv_data = emp_report.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label=f"⬇ Download {selected_emp}'s raw records (CSV)",
-        data=csv_data,
-        file_name=f"{selected_emp.replace(' ', '_')}_performance_records.csv",
-        mime="text/csv",
+        "📄 Export plan as PDF",
+        data=pdf_bytes,
+        file_name=f"{selected_emp.replace(' ', '_')}_action_plan.pdf",
+        mime="application/pdf",
+        use_container_width=True,
     )
 
 st.markdown("---")
 
-# Charts for all employees / filtered
+# Charts for all employees
 left, right = st.columns([2, 1])
 with left:
     st.subheader("Performance score by employee")
     if not df_perf.empty:
-        st.bar_chart(
-            df_perf.set_index("Team Members")["performance_score"],
-            height=350,
-        )
+        st.bar_chart(df_perf.set_index("Team Members")["performance_score"], height=350)
     else:
         st.info("No performance data available.")
+
 with right:
     st.subheader("Distribution of daily net work hours")
     if df_daily_view["net_work_hours"].dropna().empty:
         st.info("No net work hour data for this selection.")
     else:
-        st.bar_chart(
-            df_daily_view["net_work_hours"].dropna(),
-            height=350,
-        )
+        st.bar_chart(df_daily_view["net_work_hours"].dropna(), height=350)
 
 st.markdown("---")
 
@@ -1101,10 +920,7 @@ with tab1:
         "performance_score",
         "risk_flag",
     ]
-    st.dataframe(
-        df_perf[cols_show].sort_values("performance_score", ascending=False),
-        use_container_width=True,
-    )
+    st.dataframe(df_perf[cols_show].sort_values("performance_score", ascending=False), use_container_width=True)
 
 with tab2:
     st.write("Raw daily records for deeper inspection (filtered by sidebar)")
@@ -1113,11 +929,7 @@ with tab2:
 with tab3:
     st.write("AI summarized profile and reinforcement learning style recommendation")
     if team_members_all:
-        member_for_ai = st.selectbox(
-            "Choose an employee",
-            team_members_all,
-            key="ai_member",
-        )
+        member_for_ai = st.selectbox("Choose an employee", team_members_all, key="ai_member")
         row_ai = df_perf[df_perf["Team Members"] == member_for_ai].iloc[0]
         st.markdown(
             f"""
@@ -1169,10 +981,7 @@ if run_bandit:
         st.warning("No data to run the bandit on.")
     else:
         st.markdown("**Average reward over episodes**")
-        st.line_chart(
-            history_df.set_index("episode")["avg_reward"],
-            height=300,
-        )
+        st.line_chart(history_df.set_index("episode")["avg_reward"], height=300)
         st.markdown("**Estimated action values (Q) after training**")
         st.dataframe(q_df.reset_index(drop=True), use_container_width=True)
         st.markdown("**Sample of bandit experience**")
@@ -1180,9 +989,9 @@ if run_bandit:
 
 st.markdown("---")
 
-# Video and selfie analysis
+# Video + real-time camera detection
 st.subheader("Session video and selfie analysis - prototype")
-tab_vid, tab_img = st.tabs(["Video analysis", "Selfie analysis"])
+tab_vid, tab_img, tab_rt = st.tabs(["Video analysis", "Selfie analysis (snapshot)", "Real-time camera detection"])
 
 with tab_vid:
     st.markdown("#### Upload work session video")
@@ -1195,21 +1004,30 @@ with tab_vid:
     if video_file is not None:
         st.video(video_file)
         st.warning(
-            "This prototype does not yet run a deep vision model. "
-            "In production, connect this module to a pose or focus detection model to score engagement."
+            "This prototype does not yet run a deep vision model on uploaded video. "
+            "Connect this module to a vision model for engagement scoring in production."
         )
 
 with tab_img:
-    st.markdown("#### Upload selfie during session")
-    img_file = st.file_uploader(
-        "Image file",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=False,
-        key="img_upload",
-    )
-    if img_file is not None:
-        st.image(img_file, caption="Uploaded selfie", use_column_width=True)
-        st.warning(
-            "This prototype only previews the image. "
-            "In production, plug in a face analysis model for emotion and fatigue signals following your HR policy."
+    st.markdown("#### Snapshot selfie (Streamlit camera input)")
+    img = st.camera_input("Take a picture")
+    if img is not None:
+        st.image(img, caption="Snapshot selfie", use_column_width=True)
+        st.info("Note: st.camera_input is snapshot-based (not live streaming).")
+
+with tab_rt:
+    st.markdown("#### Real-time webcam face detection (live)")
+    if not REALTIME_AVAILABLE:
+        st.error(
+            "Real-time module not available. Install dependencies:\n\n"
+            "pip install streamlit-webrtc opencv-python mediapipe av"
         )
+    else:
+        webrtc_streamer(
+            key="realtime-face",
+            mode=WebRtcMode.SENDRECV,
+            video_transformer_factory=FaceDetectionTransformer,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+        st.caption("If deploying publicly, HTTPS and WebRTC network settings (STUN/TURN) may be required.")
